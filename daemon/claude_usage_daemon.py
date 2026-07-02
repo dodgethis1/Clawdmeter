@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -37,6 +38,7 @@ CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 
 API_URL = "https://api.anthropic.com/v1/messages"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HEADERS_TEMPLATE = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
@@ -272,11 +274,14 @@ async def discover_target(skip_addr: str | None = None):
 
 
 async def poll_api(token: str) -> dict | None:
-    headers = dict(API_HEADERS_TEMPLATE)
-    headers["Authorization"] = f"Bearer {token}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": API_HEADERS_TEMPLATE["anthropic-beta"],
+        "User-Agent": API_HEADERS_TEMPLATE["User-Agent"],
+    }
     try:
         async with httpx.AsyncClient(timeout=20.0) as http:
-            resp = await http.post(API_URL, headers=headers, json=API_BODY)
+            resp = await http.get(USAGE_URL, headers=headers)
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
@@ -284,33 +289,55 @@ async def poll_api(token: str) -> dict | None:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
 
-    def hdr(name: str, default: str = "0") -> str:
-        return resp.headers.get(name, default)
+    try:
+        body = resp.json()
+    except ValueError as e:
+        log(f"API returned non-JSON body: {e}")
+        return None
 
     now = time.time()
 
-    def reset_minutes(reset_ts: str) -> int:
+    def reset_minutes(iso: str | None) -> int:
+        if not iso:
+            return -1
         try:
-            r = float(reset_ts)
-        except ValueError:
-            return 0
-        mins = (r - now) / 60.0
+            ts = datetime.fromisoformat(iso).timestamp()
+        except (TypeError, ValueError):
+            return -1
+        mins = (ts - now) / 60.0
         return int(round(mins)) if mins > 0 else 0
 
-    def pct(util: str) -> int:
-        try:
-            return int(round(float(util) * 100))
-        except ValueError:
-            return 0
+    session = weekly = fable = None
+    for lim in body.get("limits") or []:
+        kind = lim.get("kind")
+        if kind == "session":
+            session = lim
+        elif kind == "weekly_all":
+            weekly = lim
+        elif kind == "weekly_scoped":
+            scope = lim.get("scope") or {}
+            name = ((scope.get("model") or {}).get("display_name") or "").lower()
+            if name == "fable":
+                fable = lim
 
+    def pct(lim: dict | None) -> int:
+        return int(lim.get("percent") or 0) if lim else 0
+
+    def rst(lim: dict | None) -> int:
+        return reset_minutes(lim.get("resets_at")) if lim else -1
+
+    severity = (session or {}).get("severity", "unknown")
     payload = {
-        "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-        "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-        "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-        "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
+        "s": pct(session),
+        "sr": rst(session),
+        "w": pct(weekly),
+        "wr": rst(weekly),
+        "st": "allowed" if severity in ("normal", "warning") else "limited",
         "ok": True,
     }
+    if fable is not None:
+        payload["f"] = pct(fable)
+        payload["fr"] = rst(fable)
     return payload
 
 
