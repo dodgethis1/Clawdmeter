@@ -400,6 +400,10 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
+                # Mark the attempt time up front so a failed poll waits a full
+                # POLL_INTERVAL before retrying instead of hammering the API
+                # every TICK seconds (which keeps a 429 rate limit pinned).
+                last_poll = time.time()
                 token = read_token()
                 if not token:
                     log("No token; skipping poll")
@@ -407,7 +411,6 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                     payload = await poll_api(token)
                     if payload is not None:
                         if await session.write_payload(payload):
-                            last_poll = time.time()
                             used_successfully = True
 
             try:
