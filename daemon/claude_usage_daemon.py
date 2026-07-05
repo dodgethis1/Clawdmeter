@@ -39,6 +39,15 @@ SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-addres
 
 API_URL = "https://api.anthropic.com/v1/messages"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# OAuth refresh — endpoint and client id used by Claude Code itself
+# (extracted from the CLI bundle; the daemon refreshes the same stored
+# credentials Claude Code uses so both stay in sync).
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+# Sentinel returned by poll_api on 401/403 so the caller can refresh + retry.
+AUTH_ERROR = object()
 API_HEADERS_TEMPLATE = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
@@ -127,6 +136,126 @@ def read_token() -> str | None:
     if sys.platform == "darwin":
         return _read_token_keychain()
     return _read_token_file()
+
+
+def _read_blob() -> str | None:
+    """Read the raw credentials blob (Keychain on macOS, file on Linux)."""
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+                 "-a", getpass.getuser(), "-w"],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError,
+                subprocess.TimeoutExpired) as e:
+            log(f"Keychain read failed: {e}")
+            return None
+        return out.stdout
+    try:
+        return CREDENTIALS_PATH.read_text()
+    except OSError as e:
+        log(f"Error reading credentials: {e}")
+        return None
+
+
+def _parse_credentials(blob: str):
+    """Return (outer, oauth) dicts, where oauth holds accessToken/refreshToken."""
+    try:
+        data = json.loads(blob.strip())
+    except json.JSONDecodeError:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    if isinstance(data.get("accessToken"), str):
+        return data, data
+    for v in data.values():
+        if isinstance(v, dict) and isinstance(v.get("accessToken"), str):
+            return data, v
+    return None, None
+
+
+def _write_credentials(outer: dict) -> bool:
+    """Persist the (updated) credentials blob back where Claude Code keeps it."""
+    blob = json.dumps(outer)
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE,
+                 "-a", getpass.getuser(), "-w", blob],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError,
+                subprocess.TimeoutExpired) as e:
+            log(f"Keychain write failed: {e}")
+            return False
+    try:
+        CREDENTIALS_PATH.write_text(blob)
+        return True
+    except OSError as e:
+        log(f"Error writing credentials: {e}")
+        return False
+
+
+async def ensure_token(force: bool = False) -> str | None:
+    """Return a valid access token, refreshing it via OAuth when expired.
+
+    Reads the same credential store Claude Code uses. If the access token
+    is expired (or ``force`` is set, e.g. after a 401), exchange the
+    refreshToken at TOKEN_URL and write the rotated credentials back so
+    Claude Code and the daemon stay in sync.
+    """
+    blob = _read_blob()
+    if blob is None:
+        return None
+    outer, oauth = _parse_credentials(blob)
+    if oauth is None:
+        return _extract_access_token(blob)  # unexpected shape — old behavior
+
+    expires_at_ms = oauth.get("expiresAt") or 0
+    if not force and time.time() * 1000 < expires_at_ms - 60_000:
+        return oauth.get("accessToken")
+
+    refresh = oauth.get("refreshToken")
+    if not refresh:
+        log("Token expired and no refreshToken present")
+        return oauth.get("accessToken")
+
+    log("Access token expired - refreshing via OAuth")
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.post(TOKEN_URL, json={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": OAUTH_CLIENT_ID,
+            })
+    except httpx.HTTPError as e:
+        log(f"Token refresh failed: {e}")
+        return None
+    if resp.status_code >= 400:
+        log(f"Token refresh HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    try:
+        tok = resp.json()
+    except ValueError:
+        log("Token refresh returned non-JSON body")
+        return None
+    if not tok.get("access_token"):
+        log("Token refresh response missing access_token")
+        return None
+
+    oauth["accessToken"] = tok["access_token"]
+    if tok.get("refresh_token"):
+        oauth["refreshToken"] = tok["refresh_token"]
+    if tok.get("expires_in"):
+        oauth["expiresAt"] = int((time.time() + tok["expires_in"]) * 1000)
+    if _write_credentials(outer):
+        log("Refreshed token stored")
+    else:
+        log("Refreshed token NOT stored (using in-memory token this run)")
+    return oauth["accessToken"]
 
 
 def load_cached_address() -> str | None:
@@ -285,6 +414,9 @@ async def poll_api(token: str) -> dict | None:
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
+    if resp.status_code in (401, 403):
+        log(f"API HTTP {resp.status_code} (auth): {resp.text[:200]}")
+        return AUTH_ERROR
     if resp.status_code >= 400:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
@@ -404,11 +536,17 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                 # POLL_INTERVAL before retrying instead of hammering the API
                 # every TICK seconds (which keeps a 429 rate limit pinned).
                 last_poll = time.time()
-                token = read_token()
+                token = await ensure_token()
                 if not token:
                     log("No token; skipping poll")
                 else:
                     payload = await poll_api(token)
+                    if payload is AUTH_ERROR:
+                        # Stored token rejected — force a refresh and retry once.
+                        token = await ensure_token(force=True)
+                        payload = await poll_api(token) if token else None
+                        if payload is AUTH_ERROR:
+                            payload = None
                     if payload is not None:
                         if await session.write_payload(payload):
                             used_successfully = True
