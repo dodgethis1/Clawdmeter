@@ -1,8 +1,10 @@
 #include "ui.h"
 #include "splash.h"
 #include <lvgl.h>
+#include <string.h>
 #include "logo.h"
 #include "icons.h"
+#include "usage_history.h"
 #include "hal/board_caps.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
@@ -128,11 +130,51 @@ static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
+// ---- History screen widgets ----
+static lv_obj_t* history_container;
+static lv_obj_t* hist_chart;
+static lv_chart_series_t* hist_series;
+static lv_obj_t* lbl_hist_peak;
+static lv_obj_t* lbl_hist_avg;
+static lv_obj_t* lbl_hist_resets;
+static lv_obj_t* lbl_anim_hist;
+
+// ---- Limited (takeover) overlay widgets ----
+static lv_obj_t* limited_overlay;
+static lv_obj_t* limited_flash;
+static lv_obj_t* lbl_lim_pill;
+static lv_obj_t* lbl_lim_countdown;
+static lv_obj_t* lbl_lim_sub;
+static lv_obj_t* bar_lim_drain;
+static lv_obj_t* lbl_lim_weekly;
+static lv_obj_t* lbl_anim_lim;
+
+// ---- Limited / milestone state ----
+static bool     s_limited = false;
+static uint32_t data_rx_ms = 0;             // lv_tick when last data arrived
+static int      s_session_reset_mins = -1;  // from last data
+static float    prev_session_pct = -1.0f;
+static float    prev_weekly_pct  = -1.0f;
+static uint32_t moment_until_ms = 0;        // splash "moment" override active
+static screen_t moment_prev = SCREEN_USAGE;
+static const char* moment_status = NULL;
+
+#define SESSION_WINDOW_MINS (5 * 60)   // drain bar scale: 5h session window
+#define MILESTONE_HOT_PCT   80.0f
+#define WEEKLY_RESET_DROP   30.0f
+
+static const char* const nap_messages[] = {
+    "Napping", "Dreaming", "Recharging", "Hibernating",
+    "Snoozing", "Counting tokens", "Resting", "Regenerating",
+};
+#define NAP_MSG_COUNT (sizeof(nap_messages) / sizeof(nap_messages[0]))      // status line: connection state + whimsical idle
+
 static lv_obj_t* logo_img;
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
+static screen_t prev_non_splash_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
@@ -325,6 +367,153 @@ static void build_pair_group(lv_obj_t* parent) {
     lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);  // ui_update_ble_status decides
 }
 
+// ======== History Screen ========
+
+// Recolor each chart segment by its value: green / amber / red, matching the
+// usage-bar thresholds.
+static void hist_chart_draw_cb(lv_event_t* e) {
+    lv_draw_task_t* t = lv_event_get_draw_task(e);
+    lv_draw_dsc_base_t* base = (lv_draw_dsc_base_t*)lv_draw_task_get_draw_dsc(t);
+    if (!base || base->part != LV_PART_ITEMS) return;
+    lv_draw_line_dsc_t* ld = lv_draw_task_get_line_dsc(t);
+    if (!ld) return;
+    int cnt = usage_history_count();
+    int idx = (int)base->id2 - (HISTORY_CAP - cnt);   // chart is right-aligned
+    ld->color = pct_color((float)usage_history_at(idx));
+}
+
+static lv_obj_t* make_stat_cell(lv_obj_t* parent, int x, int y, int w, int h,
+                                const char* caption, lv_obj_t** out_value) {
+    lv_obj_t* cell = make_panel(parent, x, y, w, h);
+    lv_obj_set_style_pad_top(cell, 6, 0);
+    lv_obj_set_style_pad_bottom(cell, 6, 0);
+
+    lv_obj_t* cap = lv_label_create(cell);
+    lv_label_set_text(cap, caption);
+    lv_obj_set_style_text_font(cap, &font_styrene_14, 0);
+    lv_obj_set_style_text_color(cap, COL_DIM, 0);
+    lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 0);
+
+    *out_value = lv_label_create(cell);
+    lv_label_set_text(*out_value, "--");
+    lv_obj_set_style_text_font(*out_value, L.usage_pct_font, 0);
+    lv_obj_set_style_text_color(*out_value, COL_TEXT, 0);
+    lv_obj_align(*out_value, LV_ALIGN_BOTTOM_MID, 0, 0);
+    return cell;
+}
+
+static void init_history_screen(lv_obj_t* scr) {
+    history_container = lv_obj_create(scr);
+    lv_obj_set_size(history_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(history_container, 0, 0);
+    lv_obj_set_style_bg_opa(history_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(history_container, 0, 0);
+    lv_obj_set_style_pad_all(history_container, 0, 0);
+    lv_obj_clear_flag(history_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(history_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* title = lv_label_create(history_container);
+    lv_label_set_text(title, "History");
+    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, L.title_y);
+
+    // Geometry derived from the shared layout so both boards work.
+    int axis_w   = 34;                                   // y-label gutter
+    int chart_x  = L.margin + axis_w;
+    int chart_y  = L.content_y + 14;
+    int chart_w  = L.content_w - axis_w;
+    int chart_h  = (L.scr_h - L.content_y) * 48 / 100;
+
+    hist_chart = lv_chart_create(history_container);
+    lv_obj_set_pos(hist_chart, chart_x, chart_y);
+    lv_obj_set_size(hist_chart, chart_w, chart_h);
+    lv_chart_set_type(hist_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(hist_chart, HISTORY_CAP);
+    lv_chart_set_range(hist_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    lv_chart_set_div_line_count(hist_chart, 3, 0);
+    lv_obj_set_style_bg_color(hist_chart, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(hist_chart, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(hist_chart, 0, 0);
+    lv_obj_set_style_radius(hist_chart, 8, 0);
+    lv_obj_set_style_line_color(hist_chart, COL_BAR_BG, LV_PART_MAIN);
+    lv_obj_set_style_line_width(hist_chart, 3, LV_PART_ITEMS);
+    lv_obj_set_style_size(hist_chart, 0, 0, LV_PART_INDICATOR);
+    lv_obj_add_flag(hist_chart, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(hist_chart, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);
+    lv_obj_add_event_cb(hist_chart, hist_chart_draw_cb, LV_EVENT_DRAW_TASK_ADDED, NULL);
+    hist_series = lv_chart_add_series(hist_chart, COL_GREEN, LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_all_value(hist_chart, hist_series, LV_CHART_POINT_NONE);
+
+    // Dashed 80% warning line over the chart.
+    static lv_point_precise_t limit_pts[2];
+    int y80 = chart_y + chart_h * 20 / 100;
+    limit_pts[0].x = chart_x;           limit_pts[0].y = y80;
+    limit_pts[1].x = chart_x + chart_w; limit_pts[1].y = y80;
+    lv_obj_t* limit_line = lv_line_create(history_container);
+    lv_line_set_points(limit_line, limit_pts, 2);
+    lv_obj_set_style_line_color(limit_line, COL_RED, 0);
+    lv_obj_set_style_line_width(limit_line, 2, 0);
+    lv_obj_set_style_line_dash_width(limit_line, 5, 0);
+    lv_obj_set_style_line_dash_gap(limit_line, 6, 0);
+    lv_obj_set_style_line_opa(limit_line, LV_OPA_60, 0);
+
+    // Y-axis labels.
+    const struct { const char* txt; int pct; } ylabels[] =
+        { {"80", 80}, {"50", 50}, {"0", 0} };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t* yl = lv_label_create(history_container);
+        lv_label_set_text(yl, ylabels[i].txt);
+        lv_obj_set_style_text_font(yl, &font_styrene_14, 0);
+        lv_obj_set_style_text_color(yl, COL_DIM, 0);
+        lv_obj_set_pos(yl, L.margin, chart_y + chart_h * (100 - ylabels[i].pct) / 100 - 8);
+    }
+
+    // X-axis labels.
+    const char* const xlabels[] = { "-8h", "-6h", "-4h", "-2h", "now" };
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t* xl = lv_label_create(history_container);
+        lv_label_set_text(xl, xlabels[i]);
+        lv_obj_set_style_text_font(xl, &font_styrene_14, 0);
+        lv_obj_set_style_text_color(xl, i == 4 ? COL_TEXT : COL_DIM, 0);
+        lv_obj_set_pos(xl, chart_x + (chart_w - 34) * i / 4, chart_y + chart_h + 6);
+    }
+
+    // Stats row: peak / avg / resets.
+    int stats_y = chart_y + chart_h + 34;
+    int stats_h = L.usage_panel_h * 60 / 100;
+    int cell_w  = (L.content_w - 20) / 3;
+    make_stat_cell(history_container, L.margin, stats_y, cell_w, stats_h,
+                   "peak", &lbl_hist_peak);
+    make_stat_cell(history_container, L.margin + cell_w + 10, stats_y, cell_w, stats_h,
+                   "avg", &lbl_hist_avg);
+    make_stat_cell(history_container, L.margin + 2 * (cell_w + 10), stats_y, cell_w, stats_h,
+                   "resets", &lbl_hist_resets);
+
+    lbl_anim_hist = lv_label_create(history_container);
+    lv_label_set_text(lbl_anim_hist, "");
+    lv_obj_set_style_text_font(lbl_anim_hist, &font_mono_32, 0);
+    lv_obj_set_style_text_color(lbl_anim_hist, COL_ACCENT, 0);
+    lv_obj_align(lbl_anim_hist, LV_ALIGN_BOTTOM_MID, 0, -15);
+
+    lv_obj_add_flag(history_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void refresh_history_widgets(void) {
+    if (!hist_chart) return;
+    int cnt = usage_history_count();
+    lv_chart_set_all_value(hist_chart, hist_series, LV_CHART_POINT_NONE);
+    for (int i = 0; i < cnt; i++) {
+        lv_chart_set_value_by_id(hist_chart, hist_series,
+                                 HISTORY_CAP - cnt + i, usage_history_at(i));
+    }
+    lv_label_set_text_fmt(lbl_hist_peak, "%d%%", usage_history_peak());
+    lv_label_set_text_fmt(lbl_hist_avg, "%d%%", usage_history_avg());
+    lv_label_set_text_fmt(lbl_hist_resets, "%d", usage_history_resets());
+    lv_obj_set_style_text_color(lbl_hist_peak,
+                                pct_color((float)usage_history_peak()), 0);
+}
+
 static void init_usage_screen(lv_obj_t* scr) {
     usage_container = lv_obj_create(scr);
     lv_obj_set_size(usage_container, L.scr_w, L.scr_h);
@@ -372,6 +561,123 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
 }
 
+// ======== Limited (rate-limit takeover) ========
+
+static void pill_pulse_cb(void* obj, int32_t v) {
+    lv_obj_set_style_opa((lv_obj_t*)obj, (lv_opa_t)v, 0);
+}
+
+static void flash_fade_cb(void* obj, int32_t v) {
+    lv_obj_set_style_bg_opa((lv_obj_t*)obj, (lv_opa_t)v, 0);
+}
+
+static void flash_done_cb(lv_anim_t* a) {
+    lv_obj_add_flag((lv_obj_t*)a->var, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void init_limited_overlay(lv_obj_t* scr) {
+    limited_overlay = lv_obj_create(scr);
+    lv_obj_set_size(limited_overlay, L.scr_w, L.scr_h);
+    lv_obj_set_pos(limited_overlay, 0, 0);
+    lv_obj_set_style_bg_opa(limited_overlay, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(limited_overlay, 0, 0);
+    lv_obj_set_style_pad_all(limited_overlay, 0, 0);
+    lv_obj_clear_flag(limited_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(limited_overlay, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lbl_lim_pill = lv_label_create(limited_overlay);
+    lv_label_set_text(lbl_lim_pill, "Rate limited");
+    lv_obj_set_style_text_font(lbl_lim_pill, L.usage_pill_font, 0);
+    lv_obj_set_style_text_color(lbl_lim_pill, COL_TEXT, 0);
+    lv_obj_set_style_bg_color(lbl_lim_pill, COL_RED, 0);
+    lv_obj_set_style_bg_opa(lbl_lim_pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(lbl_lim_pill, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_left(lbl_lim_pill, 18, 0);
+    lv_obj_set_style_pad_right(lbl_lim_pill, 18, 0);
+    lv_obj_set_style_pad_top(lbl_lim_pill, 6, 0);
+    lv_obj_set_style_pad_bottom(lbl_lim_pill, 6, 0);
+    lv_obj_align(lbl_lim_pill, LV_ALIGN_TOP_MID, 0, 18);
+
+    lbl_lim_countdown = lv_label_create(limited_overlay);
+    lv_label_set_text(lbl_lim_countdown, "-:--:--");
+    lv_obj_set_style_text_font(lbl_lim_countdown, &font_mono_32, 0);
+    lv_obj_set_style_text_color(lbl_lim_countdown, COL_TEXT, 0);
+    lv_obj_align(lbl_lim_countdown, LV_ALIGN_BOTTOM_MID, 0, -128);
+
+    lbl_lim_sub = lv_label_create(limited_overlay);
+    lv_label_set_text(lbl_lim_sub, "until session resets");
+    lv_obj_set_style_text_font(lbl_lim_sub, L.usage_reset_font, 0);
+    lv_obj_set_style_text_color(lbl_lim_sub, COL_DIM, 0);
+    lv_obj_align(lbl_lim_sub, LV_ALIGN_BOTTOM_MID, 0, -106);
+
+    bar_lim_drain = make_bar(limited_overlay, L.margin + 20, 0,
+                             L.content_w - 40, 8);
+    lv_obj_align(bar_lim_drain, LV_ALIGN_BOTTOM_MID, 0, -84);
+    lv_obj_set_style_bg_color(bar_lim_drain, COL_ACCENT, LV_PART_INDICATOR);
+
+    lbl_lim_weekly = lv_label_create(limited_overlay);
+    lv_label_set_text(lbl_lim_weekly, "");
+    lv_obj_set_style_text_font(lbl_lim_weekly, L.usage_reset_font, 0);
+    lv_obj_set_style_text_color(lbl_lim_weekly, COL_DIM, 0);
+    lv_obj_align(lbl_lim_weekly, LV_ALIGN_BOTTOM_MID, 0, -58);
+
+    lbl_anim_lim = lv_label_create(limited_overlay);
+    lv_label_set_text(lbl_anim_lim, "");
+    lv_obj_set_style_text_font(lbl_anim_lim, &font_mono_32, 0);
+    lv_obj_set_style_text_color(lbl_anim_lim, COL_ACCENT, 0);
+    lv_obj_align(lbl_anim_lim, LV_ALIGN_BOTTOM_MID, 0, -15);
+
+    // Full-screen red flash used on takeover entry (topmost, hidden).
+    limited_flash = lv_obj_create(scr);
+    lv_obj_set_size(limited_flash, L.scr_w, L.scr_h);
+    lv_obj_set_pos(limited_flash, 0, 0);
+    lv_obj_set_style_bg_color(limited_flash, COL_RED, 0);
+    lv_obj_set_style_bg_opa(limited_flash, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(limited_flash, 0, 0);
+    lv_obj_clear_flag(limited_flash, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(limited_flash, LV_OBJ_FLAG_HIDDEN);
+
+    // Slow breathing pulse on the pill, forever.
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, lbl_lim_pill);
+    lv_anim_set_exec_cb(&a, pill_pulse_cb);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_50);
+    lv_anim_set_duration(&a, 1000);
+    lv_anim_set_playback_duration(&a, 1000);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
+
+    lv_obj_add_flag(limited_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void play_entry_flash(void) {
+    if (!limited_flash) return;
+    lv_obj_clear_flag(limited_flash, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(limited_flash);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, limited_flash);
+    lv_anim_set_exec_cb(&a, flash_fade_cb);
+    lv_anim_set_values(&a, LV_OPA_70, LV_OPA_TRANSP);
+    lv_anim_set_duration(&a, 350);
+    lv_anim_set_repeat_count(&a, 2);
+    lv_anim_set_completed_cb(&a, flash_done_cb);
+    lv_anim_start(&a);
+}
+
+// Splash "moment": briefly force a named animation (milestones, limit-exit
+// celebration), then return to wherever we were.
+static void play_moment(const char* anim, uint32_t ms, const char* status) {
+    if (s_limited) return;
+    moment_prev = (current_screen == SCREEN_SPLASH || current_screen == SCREEN_LIMITED)
+                      ? prev_non_splash_screen : current_screen;
+    moment_status = status;
+    moment_until_ms = lv_tick_get() + ms;
+    splash_force_anim(anim);
+    ui_show_screen(SCREEN_SPLASH);
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -384,6 +690,7 @@ void ui_init(void) {
     init_icon_dsc_rgb565a8(&logo_dsc, LOGO_WIDTH, LOGO_HEIGHT, logo_data);
 
     init_usage_screen(scr);
+    init_history_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -393,10 +700,62 @@ void ui_init(void) {
     logo_img = lv_image_create(scr);
     lv_image_set_src(logo_img, &logo_dsc);
     lv_obj_set_pos(logo_img, L.margin, L.title_y - 10);
+
+    // Overlay last so it stacks above the splash canvas.
+    init_limited_overlay(scr);
 }
 
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
+
+    data_rx_ms = lv_tick_get();
+    s_session_reset_mins = data->session_reset_mins;
+
+    // ---- Rate-limit takeover state machine ----
+    bool lim = (strcmp(data->status, "limited") == 0);
+    if (lim && !s_limited) {
+        s_limited = true;
+        moment_until_ms = 0;
+        ui_show_screen(SCREEN_LIMITED);
+        play_entry_flash();
+    } else if (!lim && s_limited) {
+        s_limited = false;
+        splash_clear_force();
+        play_moment("dance djmix", 8000, "Back in business");
+    }
+
+    // ---- Milestone moments (skip while limited or mid-moment) ----
+    if (!s_limited && moment_until_ms == 0) {
+        if (prev_session_pct >= 0.0f &&
+            prev_session_pct < MILESTONE_HOT_PCT &&
+            data->session_pct >= MILESTONE_HOT_PCT) {
+            play_moment("expression surprise", 6000, "Redlining");
+        } else if (prev_weekly_pct >= 0.0f &&
+                   prev_weekly_pct - data->weekly_pct >= WEEKLY_RESET_DROP) {
+            play_moment("dance djmix", 8000, "Fresh week");
+        }
+    }
+    prev_session_pct = data->session_pct;
+    prev_weekly_pct  = data->weekly_pct;
+
+    // ---- History buffer + widgets ----
+    usage_history_sample(data->session_pct);
+    refresh_history_widgets();
+
+    // ---- Limited overlay extras ----
+    if (lbl_lim_weekly) {
+        char wbuf[64];
+        if (data->weekly_reset_mins >= 0) {
+            snprintf(wbuf, sizeof(wbuf), "weekly %d%%  \xC2\xB7  %dd %dh",
+                     (int)(data->weekly_pct + 0.5f),
+                     data->weekly_reset_mins / 1440,
+                     (data->weekly_reset_mins % 1440) / 60);
+        } else {
+            snprintf(wbuf, sizeof(wbuf), "weekly %d%%",
+                     (int)(data->weekly_pct + 0.5f));
+        }
+        lv_label_set_text(lbl_lim_weekly, wbuf);
+    }
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
@@ -418,9 +777,45 @@ void ui_update(const UsageData* data) {
 }
 
 void ui_tick_anim(void) {
-    if (current_screen != SCREEN_USAGE) return;
-
     uint32_t now = lv_tick_get();
+
+    // ---- Moment expiry: return to wherever we were ----
+    if (moment_until_ms != 0 && (int32_t)(now - moment_until_ms) >= 0) {
+        moment_until_ms = 0;
+        moment_status = NULL;
+        splash_clear_force();
+        ui_show_screen(moment_prev);
+    }
+
+    // ---- Live countdown while limited (once a second is plenty) ----
+    if (s_limited && lbl_lim_countdown && s_session_reset_mins >= 0) {
+        static uint32_t last_cd_ms = 0;
+        if (now - last_cd_ms >= 1000) {
+            last_cd_ms = now;
+            int64_t remaining_ms =
+                (int64_t)s_session_reset_mins * 60000 - (int64_t)(now - data_rx_ms);
+            if (remaining_ms < 0) remaining_ms = 0;
+            uint32_t secs = remaining_ms / 1000;
+            lv_label_set_text_fmt(lbl_lim_countdown, "%u:%02u:%02u",
+                                  (unsigned)(secs / 3600),
+                                  (unsigned)((secs % 3600) / 60),
+                                  (unsigned)(secs % 60));
+            int64_t window_ms = (int64_t)SESSION_WINDOW_MINS * 60000;
+            int drained = (int)(100 - remaining_ms * 100 / window_ms);
+            if (drained < 0) drained = 0;
+            if (drained > 100) drained = 100;
+            lv_bar_set_value(bar_lim_drain, drained, LV_ANIM_ON);
+        }
+    }
+
+    // ---- Status line: pick the label on the visible screen ----
+    lv_obj_t* target;
+    switch (current_screen) {
+    case SCREEN_USAGE:   target = lbl_anim;      break;
+    case SCREEN_HISTORY: target = lbl_anim_hist; break;
+    case SCREEN_LIMITED: target = lbl_anim_lim;  break;
+    default:             return;
+    }
 
     if (now - anim_msg_start >= ANIM_MSG_MS) {
         anim_msg_idx = (anim_msg_idx + 1) % ANIM_MSG_COUNT;
@@ -435,7 +830,11 @@ void ui_tick_anim(void) {
 
     // Status text by priority. Whimsical messages only when connected & settled.
     const char* text;
-    if (!s_ble_connected) {
+    if (moment_status) {
+        text = moment_status;
+    } else if (s_limited) {
+        text = nap_messages[anim_msg_idx % NAP_MSG_COUNT];
+    } else if (!s_ble_connected) {
         text = ble_has_bonds() ? "Disconnected" : "Pairing";
     } else if (now - connected_at_ms < 5000) {
         text = "Connected";
@@ -447,10 +846,8 @@ void ui_tick_anim(void) {
     static char buf[80];
     snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6",
              spinner_frames[anim_spinner_idx], text);
-    lv_label_set_text(lbl_anim, buf);
+    lv_label_set_text(target, buf);
 }
-
-static screen_t prev_non_splash_screen = SCREEN_USAGE;
 
 // ---- Auto-cycle: alternate Usage <-> Activity (splash). A tap switches
 // immediately and pauses the cycle so it doesn't fight the user.
@@ -458,41 +855,65 @@ static screen_t prev_non_splash_screen = SCREEN_USAGE;
 #define SCREEN_CYCLE_TAP_PAUSE_MS 30000
 static uint32_t next_auto_cycle_ms = SCREEN_CYCLE_INTERVAL_MS;
 
+// Usage -> History -> Activity (splash) -> Usage.
+static screen_t next_cycle_screen(screen_t s) {
+    switch (s) {
+    case SCREEN_USAGE:   return SCREEN_HISTORY;
+    case SCREEN_HISTORY: return SCREEN_SPLASH;
+    default:             return SCREEN_USAGE;
+    }
+}
+
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    if (s_limited) return;                  // takeover owns the screen
+    if (moment_until_ms != 0) {             // tap skips a moment early
+        moment_until_ms = 0;
+        moment_status = NULL;
+        splash_clear_force();
+        ui_show_screen(moment_prev);
+    } else {
+        ui_show_screen(next_cycle_screen(current_screen));
+    }
     next_auto_cycle_ms = lv_tick_get() + SCREEN_CYCLE_TAP_PAUSE_MS;
 }
 
 void ui_tick_screen_cycle(void) {
+    if (s_limited || moment_until_ms != 0) return;
     if ((int32_t)(lv_tick_get() - next_auto_cycle_ms) < 0) return;
-    ui_toggle_splash();
+    ui_show_screen(next_cycle_screen(current_screen));
 }
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    if (history_container) lv_obj_add_flag(history_container, LV_OBJ_FLAG_HIDDEN);
+    if (limited_overlay)   lv_obj_add_flag(limited_overlay, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:  splash_show(); break;
     case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_HISTORY: lv_obj_clear_flag(history_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_LIMITED:
+        // Sleeping creature on the splash canvas + info overlay on top.
+        splash_force_anim("expression sleep");
+        splash_show();
+        lv_obj_clear_flag(limited_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(limited_overlay);
+        break;
     default: break;
     }
 
+    bool logo_hidden = (screen == SCREEN_SPLASH || screen == SCREEN_LIMITED);
     if (logo_img) {
-        if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-        else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        if (logo_hidden) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        else             lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
+    if (screen == SCREEN_USAGE || screen == SCREEN_HISTORY)
+        prev_non_splash_screen = screen;
     current_screen = screen;
     next_auto_cycle_ms = lv_tick_get() + SCREEN_CYCLE_INTERVAL_MS;
-}
-
-void ui_toggle_splash(void) {
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
 }
 
 screen_t ui_get_current_screen(void) {

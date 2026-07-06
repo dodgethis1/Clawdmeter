@@ -56,6 +56,10 @@ static uint8_t deck_pos = SPLASH_ANIM_COUNT;   // >= count forces a shuffle
 static bool cur_shiny = false;
 static uint16_t shiny_palette[SPLASH_PALETTE_SIZE];
 
+// When forced (takeover / milestone moment), hold one animation and skip
+// auto-rotate and rate re-picks until cleared.
+static bool forced = false;
+
 static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
     // Group 0 — idle / sleepy
     { "expression sleep", "idle breathe", "idle blink", "expression wink" },
@@ -225,7 +229,7 @@ void splash_tick(void) {
     if (!active || SPLASH_ANIM_COUNT == 0) return;
 
     // Auto-rotate to the next animation in the current group.
-    if (millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
+    if (!forced && millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
         splash_pick_for_current_rate();
     }
 
@@ -242,12 +246,30 @@ void splash_tick(void) {
 
 void splash_next(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
+    forced = false;   // manual advance releases any hold
     set_current((cur_anim + 1) % SPLASH_ANIM_COUNT);
     Serial.printf("splash: -> %s\n", splash_anims[cur_anim].name);
 }
 
+void splash_force_anim(const char* name) {
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
+        if (strcmp(splash_anims[i].name, name) == 0) {
+            forced = true;
+            set_current((uint16_t)i);
+            Serial.printf("splash: forced -> %s\n", name);
+            return;
+        }
+    }
+    Serial.printf("splash: force failed, no anim named '%s'\n", name);
+}
+
+void splash_clear_force(void) {
+    forced = false;
+}
+
 void splash_pick_for_current_rate(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
+    if (forced) return;
 
     // Wildcard turn: draw from the full shuffled deck instead of the group.
     if (--rotations_until_wildcard == 0) {

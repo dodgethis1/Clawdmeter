@@ -21,6 +21,11 @@ void splash_hide(void);
 // trigger a re-pick when the rate group changes mid-display.
 void splash_pick_for_current_rate(void);
 
+// Force a named animation and hold it (no auto-rotate, no rate re-picks)
+// until cleared. Used by the rate-limit takeover and milestone moments.
+void splash_force_anim(const char* name);
+void splash_clear_force(void);
+
 // True when splash is currently rendering (used to gate re-picks).
 bool splash_is_active(void);
 
