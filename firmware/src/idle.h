@@ -11,6 +11,11 @@ void idle_note_activity(void);
 // picked up by the next fade-in. See brightness.{h,cpp}.
 void idle_set_awake_brightness(uint8_t level);
 
+// Night-dim cap for burn-in prevention: effective brightness is
+// min(awake level, cap). Pass 255 to lift the cap. Applied immediately
+// when fully awake.
+void idle_set_night_cap(uint8_t cap);
+
 // Returns true if this press was consumed as a wake-up (caller MUST skip the
 // button's normal action). Returns false when already awake — also notes the
 // activity, so callers don't need a separate idle_note_activity() call.

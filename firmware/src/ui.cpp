@@ -7,6 +7,8 @@
 #include "usage_history.h"
 #include "weekly_history.h"
 #include "usage_rate.h"
+#include "idle.h"
+#include "idle_cfg.h"
 #include "hal/board_caps.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
@@ -217,6 +219,7 @@ static lv_obj_t* logo_img;
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
+static lv_obj_t* ui_root;   // everything lives here; orbits for burn-in
 static screen_t current_screen = SCREEN_USAGE;
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
@@ -853,41 +856,51 @@ void ui_init(void) {
     lv_obj_set_style_bg_color(scr, COL_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
+    // Root container everything lives in. Periodically nudged a few px
+    // (burn-in prevention) — invisible against the true-black screen bg.
+    ui_root = lv_obj_create(scr);
+    lv_obj_set_size(ui_root, L.scr_w, L.scr_h);
+    lv_obj_set_pos(ui_root, 0, 0);
+    lv_obj_set_style_bg_opa(ui_root, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ui_root, 0, 0);
+    lv_obj_set_style_pad_all(ui_root, 0, 0);
+    lv_obj_clear_flag(ui_root, LV_OBJ_FLAG_SCROLLABLE);
+
     init_icon_dsc_rgb565a8(&logo_dsc, LOGO_WIDTH, LOGO_HEIGHT, logo_data);
 
-    init_usage_screen(scr);
+    init_usage_screen(ui_root);
 
     static const char* const hist_x[5] = { "-8h", "-6h", "-4h", "-2h", "now" };
     static const char* const hist_caps[3] = { "peak", "avg", "resets" };
-    build_trend_page(&pg_history, scr, "History", HISTORY_CAP, hist_x, hist_caps,
+    build_trend_page(&pg_history, ui_root, "History", HISTORY_CAP, hist_x, hist_caps,
                      usage_history_at, usage_history_count);
 
     static const char* const week_x[5] = { "-7d", "-5d", "-4d", "-2d", "now" };
     static const char* const week_caps[3] = { "peak", "avg", "now" };
-    build_trend_page(&pg_weekly, scr, "Weekly", WEEKLY_CAP, week_x, week_caps,
+    build_trend_page(&pg_weekly, ui_root, "Weekly", WEEKLY_CAP, week_x, week_caps,
                      weekly_history_at, weekly_history_count);
 
-    init_models_screen(scr);
+    init_models_screen(ui_root);
     weekly_history_init();
-    splash_init(scr);
+    splash_init(ui_root);
 
     if (splash_get_root()) {
         lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
     }
 
-    logo_img = lv_image_create(scr);
+    logo_img = lv_image_create(ui_root);
     lv_image_set_src(logo_img, &logo_dsc);
     lv_obj_set_pos(logo_img, L.margin, L.title_y - 10);
 
     // Persistent clock, top right — the battery indicator's old spot.
-    lbl_clock = lv_label_create(scr);
+    lbl_clock = lv_label_create(ui_root);
     lv_label_set_text(lbl_clock, "");
     lv_obj_set_style_text_font(lbl_clock, &font_styrene_28, 0);
     lv_obj_set_style_text_color(lbl_clock, COL_TEXT, 0);
     lv_obj_align(lbl_clock, LV_ALIGN_TOP_RIGHT, -L.margin, L.title_y);
 
     // Overlay last so it stacks above the splash canvas.
-    init_limited_overlay(scr);
+    init_limited_overlay(ui_root);
 }
 
 void ui_update(const UsageData* data) {
@@ -1046,7 +1059,20 @@ void ui_tick_anim(void) {
         }
     }
 
-    // ---- Clock tick (once a second) ----
+    // ---- Burn-in pixel shift: orbit the whole UI a few px ----
+    if (ui_root) {
+        static const int8_t sdx[5] = { 0,  BURNIN_SHIFT_PX, 0, -BURNIN_SHIFT_PX, 0 };
+        static const int8_t sdy[5] = { 0, 0,  BURNIN_SHIFT_PX, 0, -BURNIN_SHIFT_PX };
+        static uint8_t  shift_idx = 0;
+        static uint32_t shift_last_ms = 0;
+        if (now - shift_last_ms >= BURNIN_SHIFT_INTERVAL_MS) {
+            shift_last_ms = now;
+            shift_idx = (shift_idx + 1) % 5;
+            lv_obj_set_pos(ui_root, sdx[shift_idx], sdy[shift_idx]);
+        }
+    }
+
+    // ---- Clock tick (once a second) + night dim window ----
     if (lbl_clock && clock_base_mins >= 0) {
         static uint32_t last_clk_ms = 0;
         if (now - last_clk_ms >= 1000) {
@@ -1055,6 +1081,11 @@ void ui_tick_anim(void) {
             char cbuf[8];
             format_clock_time(cur, cbuf, sizeof(cbuf));
             lv_label_set_text(lbl_clock, cbuf);
+
+            bool night = (NIGHT_DIM_START_MIN <= NIGHT_DIM_END_MIN)
+                ? (cur >= NIGHT_DIM_START_MIN && cur < NIGHT_DIM_END_MIN)
+                : (cur >= NIGHT_DIM_START_MIN || cur < NIGHT_DIM_END_MIN);
+            idle_set_night_cap(night ? NIGHT_BRIGHTNESS_CAP : 255);
         }
     }
 
