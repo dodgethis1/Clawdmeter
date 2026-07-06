@@ -69,13 +69,13 @@ static void compute_layout(const BoardCaps& c) {
         L.content_y = 90;
         L.usage_panel_h = 150;
         L.usage_panel_gap = 10;
-        L.usage_bar_y = 88;
+        L.usage_bar_y = 92;
         L.usage_bar_h = 30;
         L.usage_arc_size = 118;
         L.usage_arc_width = 16;
         L.usage_pct_font = &font_styrene_48;
-        L.usage_pill_font = &font_styrene_20;
-        L.usage_reset_font = &font_styrene_16;
+        L.usage_pill_font = &font_styrene_24;
+        L.usage_reset_font = &font_styrene_20;
         L.bt_info_panel_h = 160;
         L.bt_reset_zone_h = 110;
         L.bt_title_font    = &font_tiempos_56;
@@ -94,7 +94,7 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_arc_width = 12;
         L.usage_pct_font = &font_styrene_28;
         L.usage_pill_font = &font_styrene_16;
-        L.usage_reset_font = &font_styrene_14;
+        L.usage_reset_font = &font_styrene_16;
         L.bt_info_panel_h = 140;
         L.bt_reset_zone_h = 90;
         L.bt_title_font    = &font_tiempos_34;
@@ -248,11 +248,11 @@ static void format_reset_time(int mins, char* buf, size_t len) {
     if (mins < 0) {
         snprintf(buf, len, "---");
     } else if (mins < 60) {
-        snprintf(buf, len, "Resets in %dm", mins);
+        snprintf(buf, len, "Resets %dm", mins);
     } else if (mins < 1440) {
-        snprintf(buf, len, "Resets in %dh %dm", mins / 60, mins % 60);
+        snprintf(buf, len, "Resets %dh %dm", mins / 60, mins % 60);
     } else {
-        snprintf(buf, len, "Resets in %dd %dh", mins / 1440, (mins % 1440) / 60);
+        snprintf(buf, len, "Resets %dd %dh", mins / 1440, (mins % 1440) / 60);
     }
 }
 
@@ -428,13 +428,13 @@ static lv_obj_t* make_stat_cell(lv_obj_t* parent, int x, int y, int w, int h,
 
     lv_obj_t* cap = lv_label_create(cell);
     lv_label_set_text(cap, caption);
-    lv_obj_set_style_text_font(cap, &font_styrene_14, 0);
+    lv_obj_set_style_text_font(cap, L.usage_reset_font, 0);
     lv_obj_set_style_text_color(cap, COL_DIM, 0);
     lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 0);
 
     *out_value = lv_label_create(cell);
     lv_label_set_text(*out_value, "--");
-    lv_obj_set_style_text_font(*out_value, &font_styrene_28, 0);
+    lv_obj_set_style_text_font(*out_value, L.usage_pct_font, 0);
     lv_obj_set_style_text_color(*out_value, COL_TEXT, 0);
     lv_obj_align(*out_value, LV_ALIGN_BOTTOM_MID, 0, 0);
     return cell;
@@ -457,11 +457,11 @@ static void init_history_screen(lv_obj_t* scr) {
     lv_obj_align(title, LV_ALIGN_TOP_MID, 16, L.title_y);
 
     // Geometry derived from the shared layout so both boards work.
-    int axis_w   = 34;                                   // y-label gutter
+    int axis_w   = 38;                                   // y-label gutter
     int chart_x  = L.margin + axis_w;
     int chart_y  = L.content_y + 14;
     int chart_w  = L.content_w - axis_w;
-    int chart_h  = (L.scr_h - L.content_y) * 48 / 100;
+    int chart_h  = (L.scr_h - L.content_y) * 44 / 100;
 
     hist_chart = lv_chart_create(history_container);
     lv_obj_set_pos(hist_chart, chart_x, chart_y);
@@ -502,9 +502,9 @@ static void init_history_screen(lv_obj_t* scr) {
     for (int i = 0; i < 3; i++) {
         lv_obj_t* yl = lv_label_create(history_container);
         lv_label_set_text(yl, ylabels[i].txt);
-        lv_obj_set_style_text_font(yl, &font_styrene_14, 0);
+        lv_obj_set_style_text_font(yl, L.usage_reset_font, 0);
         lv_obj_set_style_text_color(yl, COL_DIM, 0);
-        lv_obj_set_pos(yl, L.margin, chart_y + chart_h * (100 - ylabels[i].pct) / 100 - 8);
+        lv_obj_set_pos(yl, L.margin, chart_y + chart_h * (100 - ylabels[i].pct) / 100 - 10);
     }
 
     // X-axis labels.
@@ -512,14 +512,14 @@ static void init_history_screen(lv_obj_t* scr) {
     for (int i = 0; i < 5; i++) {
         lv_obj_t* xl = lv_label_create(history_container);
         lv_label_set_text(xl, xlabels[i]);
-        lv_obj_set_style_text_font(xl, &font_styrene_14, 0);
+        lv_obj_set_style_text_font(xl, L.usage_reset_font, 0);
         lv_obj_set_style_text_color(xl, i == 4 ? COL_TEXT : COL_DIM, 0);
-        lv_obj_set_pos(xl, chart_x + (chart_w - 34) * i / 4, chart_y + chart_h + 6);
+        lv_obj_set_pos(xl, chart_x + (chart_w - 44) * i / 4, chart_y + chart_h + 6);
     }
 
     // Stats row: peak / avg / resets.
-    int stats_y = chart_y + chart_h + 34;
-    int stats_h = L.usage_panel_h * 60 / 100;
+    int stats_y = chart_y + chart_h + 38;
+    int stats_h = L.usage_panel_h * 68 / 100;
     int cell_w  = (L.content_w - 20) / 3;
     make_stat_cell(history_container, L.margin, stats_y, cell_w, stats_h,
                    "peak", &lbl_hist_peak);
@@ -636,19 +636,19 @@ static void init_limited_overlay(lv_obj_t* scr) {
 
     lbl_lim_countdown = lv_label_create(limited_overlay);
     lv_label_set_text(lbl_lim_countdown, "-:--:--");
-    lv_obj_set_style_text_font(lbl_lim_countdown, &font_mono_32, 0);
+    lv_obj_set_style_text_font(lbl_lim_countdown, L.usage_pct_font, 0);
     lv_obj_set_style_text_color(lbl_lim_countdown, COL_TEXT, 0);
-    lv_obj_align(lbl_lim_countdown, LV_ALIGN_BOTTOM_MID, 0, -128);
+    lv_obj_align(lbl_lim_countdown, LV_ALIGN_BOTTOM_MID, 0, -140);
 
     lbl_lim_sub = lv_label_create(limited_overlay);
     lv_label_set_text(lbl_lim_sub, "until session resets");
     lv_obj_set_style_text_font(lbl_lim_sub, L.usage_reset_font, 0);
     lv_obj_set_style_text_color(lbl_lim_sub, COL_DIM, 0);
-    lv_obj_align(lbl_lim_sub, LV_ALIGN_BOTTOM_MID, 0, -106);
+    lv_obj_align(lbl_lim_sub, LV_ALIGN_BOTTOM_MID, 0, -110);
 
     bar_lim_drain = make_bar(limited_overlay, L.margin + 20, 0,
                              L.content_w - 40, 8);
-    lv_obj_align(bar_lim_drain, LV_ALIGN_BOTTOM_MID, 0, -84);
+    lv_obj_align(bar_lim_drain, LV_ALIGN_BOTTOM_MID, 0, -88);
     lv_obj_set_style_bg_color(bar_lim_drain, COL_ACCENT, LV_PART_INDICATOR);
 
     lbl_lim_weekly = lv_label_create(limited_overlay);

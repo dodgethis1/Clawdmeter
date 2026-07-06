@@ -30,6 +30,12 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+CONNECT_TIMEOUT = 20.0   # CoreBluetooth connect can hang forever without this
+WATCHDOG_SECS = 600      # no successful send in this long -> exit, launchd relaunches
+
+# Watchdog heartbeat: updated on every successful BLE write. A list so the
+# watchdog task and connect loop share it without global statements.
+_last_alive = [time.time()]
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -503,9 +509,15 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     log(f"Connecting to {display}...")
     client = BleakClient(target)
     try:
-        await client.connect()
+        # Hard cap the connect: CoreBluetooth has been observed to sit in
+        # connect() indefinitely when the OS holds a stale peripheral handle.
+        await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
     except (BleakError, asyncio.TimeoutError) as e:
-        log(f"Connection failed: {e}")
+        log(f"Connection failed: {e or 'timed out'}")
+        try:
+            await client.disconnect()
+        except (BleakError, Exception):
+            pass
         return False
 
     if not client.is_connected:
@@ -542,6 +554,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                     if payload is not None:
                         if await session.write_payload(payload):
                             used_successfully = True
+                            _last_alive[0] = time.time()
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
@@ -573,6 +586,21 @@ async def main() -> None:
 
     log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
+
+    # Watchdog: if nothing has been successfully sent to the device in
+    # WATCHDOG_SECS, assume we're wedged (hung connect, dead event loop,
+    # zombie BLE stack) and exit hard. launchd's KeepAlive relaunches us
+    # with a clean slate. os._exit because a hung CoreBluetooth await
+    # ignores task cancellation — a polite SystemExit never lands.
+    async def _watchdog() -> None:
+        while not stop_event.is_set():
+            await asyncio.sleep(30)
+            stale = time.time() - _last_alive[0]
+            if stale > WATCHDOG_SECS:
+                log(f"Watchdog: no successful send in {int(stale)}s - exiting for relaunch")
+                os._exit(1)
+
+    asyncio.get_running_loop().create_task(_watchdog())
 
     backoff = 1
     skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle
