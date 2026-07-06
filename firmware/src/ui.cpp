@@ -34,7 +34,8 @@ struct Layout {
     int16_t usage_panel_gap;
     int16_t usage_bar_y;
     int16_t usage_bar_h;
-    int16_t usage_reset_y;
+    int16_t usage_arc_size;
+    int16_t usage_arc_width;
     const lv_font_t* usage_pct_font;
     const lv_font_t* usage_pill_font;
     const lv_font_t* usage_reset_font;
@@ -62,15 +63,17 @@ static void compute_layout(const BoardCaps& c) {
 
     if (c.height >= 460) {
         // Large layout — tuned for 480x480 (AMOLED-2.16).
-        // Compact three-slot geometry: Current + Weekly panels, third slot
-        // reserved for the usage sparkline, all above the status line.
+        // Two oversized panels (Current / Weekly) fill the screen: giant
+        // percentage, thick bar, and a donut gauge — readable from across
+        // the room.
         L.content_y = 90;
-        L.usage_panel_h = 104;
+        L.usage_panel_h = 150;
         L.usage_panel_gap = 10;
-        L.usage_bar_y = 36;
-        L.usage_bar_h = 20;
-        L.usage_reset_y = 62;
-        L.usage_pct_font = &font_styrene_28;
+        L.usage_bar_y = 88;
+        L.usage_bar_h = 30;
+        L.usage_arc_size = 118;
+        L.usage_arc_width = 16;
+        L.usage_pct_font = &font_styrene_48;
         L.usage_pill_font = &font_styrene_20;
         L.usage_reset_font = &font_styrene_16;
         L.bt_info_panel_h = 160;
@@ -81,14 +84,15 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_credit_1_font = &font_styrene_24;
         L.bt_credit_2_font = &font_styrene_20;
     } else {
-        // Compact layout — tuned for 368x448 (AMOLED-1.8), three panels.
+        // Compact layout — tuned for 368x448 (AMOLED-1.8), two big panels.
         L.content_y = 70;
-        L.usage_panel_h = 92;
+        L.usage_panel_h = 118;
         L.usage_panel_gap = 8;
-        L.usage_bar_y = 30;
-        L.usage_bar_h = 14;
-        L.usage_reset_y = 48;
-        L.usage_pct_font = &font_styrene_20;
+        L.usage_bar_y = 58;
+        L.usage_bar_h = 20;
+        L.usage_arc_size = 84;
+        L.usage_arc_width = 12;
+        L.usage_pct_font = &font_styrene_28;
         L.usage_pill_font = &font_styrene_16;
         L.usage_reset_font = &font_styrene_14;
         L.bt_info_panel_h = 140;
@@ -124,10 +128,12 @@ static lv_obj_t* bar_session;
 static lv_obj_t* lbl_session_pct;
 static lv_obj_t* lbl_session_label;
 static lv_obj_t* lbl_session_reset;
+static lv_obj_t* arc_session;
 static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
+static lv_obj_t* arc_weekly;
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
 // ---- History screen widgets ----
@@ -311,27 +317,59 @@ static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
 
 // ======== Usage Screen ========
 
+// Donut gauge: a full-circle arc that fills clockwise from 12 o'clock, with
+// a short window label ("5h" / "7d") in the hole.
+static lv_obj_t* make_donut(lv_obj_t* parent, const char* center_text) {
+    lv_obj_t* arc = lv_arc_create(parent);
+    lv_obj_set_size(arc, L.usage_arc_size, L.usage_arc_size);
+    lv_arc_set_rotation(arc, 270);
+    lv_arc_set_bg_angles(arc, 0, 360);
+    lv_arc_set_range(arc, 0, 100);
+    lv_arc_set_value(arc, 0);
+    lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(arc, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_style_arc_width(arc, L.usage_arc_width, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, L.usage_arc_width, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, COL_BAR_BG, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, COL_GREEN, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
+    lv_obj_align(arc, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    lv_obj_t* center = lv_label_create(arc);
+    lv_label_set_text(center, center_text);
+    lv_obj_set_style_text_font(center, L.usage_pill_font, 0);
+    lv_obj_set_style_text_color(center, COL_DIM, 0);
+    lv_obj_center(center);
+    return arc;
+}
+
 static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
+                             const char* window_text,
                              lv_obj_t** out_pct, lv_obj_t** out_pill,
-                             lv_obj_t** out_bar, lv_obj_t** out_reset) {
+                             lv_obj_t** out_bar, lv_obj_t** out_reset,
+                             lv_obj_t** out_arc) {
     lv_obj_t* panel = make_panel(parent, L.margin, y, L.content_w, L.usage_panel_h);
 
-    *out_pct = lv_label_create(panel);
-    lv_label_set_text(*out_pct, "---%");
-    lv_obj_set_style_text_font(*out_pct, L.usage_pct_font, 0);
-    lv_obj_set_style_text_color(*out_pct, COL_TEXT, 0);
-    lv_obj_set_pos(*out_pct, 0, 0);
-
     *out_pill = make_pill(panel, pill_text);
-    lv_obj_align(*out_pill, LV_ALIGN_TOP_RIGHT, 0, 1);
-
-    *out_bar = make_bar(panel, 0, L.usage_bar_y, L.content_w - 32, L.usage_bar_h);
+    lv_obj_align(*out_pill, LV_ALIGN_TOP_LEFT, 0, 0);
 
     *out_reset = lv_label_create(panel);
     lv_label_set_text(*out_reset, "---");
     lv_obj_set_style_text_font(*out_reset, L.usage_reset_font, 0);
     lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
-    lv_obj_set_pos(*out_reset, 0, L.usage_reset_y);
+    lv_obj_align(*out_reset, LV_ALIGN_TOP_RIGHT, -(L.usage_arc_size + 14), 6);
+
+    *out_pct = lv_label_create(panel);
+    lv_label_set_text(*out_pct, "---%");
+    lv_obj_set_style_text_font(*out_pct, L.usage_pct_font, 0);
+    lv_obj_set_style_text_color(*out_pct, COL_TEXT, 0);
+    lv_obj_set_pos(*out_pct, 0, L.usage_pill_font->line_height + 8);
+
+    int bar_w = L.content_w - 32 - L.usage_arc_size - 14;
+    *out_bar = make_bar(panel, 0, L.usage_bar_y, bar_w, L.usage_bar_h);
+
+    *out_arc = make_donut(panel, window_text);
 }
 
 // Pairing hint — shown when disconnected so the screen isn't empty and the
@@ -396,7 +434,7 @@ static lv_obj_t* make_stat_cell(lv_obj_t* parent, int x, int y, int w, int h,
 
     *out_value = lv_label_create(cell);
     lv_label_set_text(*out_value, "--");
-    lv_obj_set_style_text_font(*out_value, L.usage_pct_font, 0);
+    lv_obj_set_style_text_font(*out_value, &font_styrene_28, 0);
     lv_obj_set_style_text_color(*out_value, COL_TEXT, 0);
     lv_obj_align(*out_value, LV_ALIGN_BOTTOM_MID, 0, 0);
     return cell;
@@ -541,15 +579,13 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_clear_flag(usage_group, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(usage_group, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    make_usage_panel(usage_group, L.content_y, "Current",
+    make_usage_panel(usage_group, L.content_y, "Current", "5h",
                      &lbl_session_pct, &lbl_session_label,
-                     &bar_session, &lbl_session_reset);
+                     &bar_session, &lbl_session_reset, &arc_session);
     make_usage_panel(usage_group,
-                     L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly",
+                     L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly", "7d",
                      &lbl_weekly_pct, &lbl_weekly_label,
-                     &bar_weekly, &lbl_weekly_reset);
-    // Third panel slot (formerly Fable) is intentionally open — reserved
-    // for the session-usage sparkline.
+                     &bar_weekly, &lbl_weekly_reset, &arc_weekly);
 
     build_pair_group(usage_container);
 
@@ -762,6 +798,9 @@ void ui_update(const UsageData* data) {
     lv_label_set_text_fmt(lbl_session_pct, "%d%%", s_pct);
     lv_bar_set_value(bar_session, s_pct, LV_ANIM_ON);
     lv_obj_set_style_bg_color(bar_session, pct_color(data->session_pct), LV_PART_INDICATOR);
+    lv_arc_set_value(arc_session, s_pct);
+    lv_obj_set_style_arc_color(arc_session, pct_color(data->session_pct), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(lbl_session_pct, pct_color(data->session_pct), 0);
 
     char buf[48];
     format_reset_time(data->session_reset_mins, buf, sizeof(buf));
@@ -771,6 +810,9 @@ void ui_update(const UsageData* data) {
     lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
     lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
     lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
+    lv_arc_set_value(arc_weekly, w_pct);
+    lv_obj_set_style_arc_color(arc_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(lbl_weekly_pct, pct_color(data->weekly_pct), 0);
 
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
