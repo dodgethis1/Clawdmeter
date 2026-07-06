@@ -10,3 +10,7 @@ void usage_rate_sample(float session_pct);
 // 0 = idle, 1 = normal, 2 = active, 3 = heavy.
 // Defaults to 0 when the buffer doesn't have enough samples yet.
 int usage_rate_group(void);
+
+// EMA-smoothed burn rate in %/min for time-to-limit projection.
+// Returns a negative value until warmed up (~2 poll windows).
+float usage_rate_slope(void);

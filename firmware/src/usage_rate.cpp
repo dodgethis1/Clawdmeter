@@ -33,9 +33,29 @@ static inline uint8_t oldest_idx(void) {
     return (head + RING_SIZE - count) % RING_SIZE;
 }
 
+// Slow EMA of the window slope for time-to-limit projection. Alpha 0.08 at
+// 60s samples gives a ~13-minute time constant — stable enough to display,
+// lazy enough to ignore single bursts.
+#define SLOPE_EMA_ALPHA 0.08f
+static float slope_ema = 0.0f;
+static bool  slope_warm = false;
+
 static void usage_rate_reset(void) {
     count = 0;
     head  = 0;
+    slope_ema = 0.0f;
+    slope_warm = false;
+}
+
+static float window_slope(void) {
+    if (count < 2) return -1.0f;
+    uint8_t o = oldest_idx();
+    uint8_t l = (head + RING_SIZE - 1) % RING_SIZE;
+    uint32_t dt = ring[l].ms - ring[o].ms;
+    if (dt < MIN_WINDOW_MS) return -1.0f;
+    float dp = ring[l].pct - ring[o].pct;
+    if (dp < 0.0f) dp = 0.0f;
+    return dp * 60000.0f / (float)dt;
 }
 
 void usage_rate_sample(float session_pct) {
@@ -52,19 +72,21 @@ void usage_rate_sample(float session_pct) {
     ring[head] = { now, session_pct };
     head = (head + 1) % RING_SIZE;
     if (count < RING_SIZE) count++;
+
+    float raw = window_slope();
+    if (raw >= 0.0f) {
+        if (!slope_warm) { slope_ema = raw; slope_warm = true; }
+        else             { slope_ema += SLOPE_EMA_ALPHA * (raw - slope_ema); }
+    }
+}
+
+float usage_rate_slope(void) {
+    return slope_warm ? slope_ema : -1.0f;
 }
 
 int usage_rate_group(void) {
-    if (count < 2) return 0;
-
-    uint8_t o = oldest_idx();
-    uint8_t l = (head + RING_SIZE - 1) % RING_SIZE;
-    uint32_t dt = ring[l].ms - ring[o].ms;
-    if (dt < MIN_WINDOW_MS) return 0;
-
-    float dp = ring[l].pct - ring[o].pct;
-    if (dp < 0.0f) dp = 0.0f;
-    float rate = dp * 60000.0f / (float)dt;
+    float rate = window_slope();
+    if (rate < 0.0f) return 0;
 
     if (rate < RATE_THRESH_NORMAL) return 0;
     if (rate < RATE_THRESH_ACTIVE) return 1;

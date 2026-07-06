@@ -446,12 +446,15 @@ async def poll_api(token: str) -> dict | None:
         return int(round(mins)) if mins > 0 else 0
 
     session = weekly = None
+    scoped: list[dict] = []
     for lim in body.get("limits") or []:
         kind = lim.get("kind")
         if kind == "session":
             session = lim
         elif kind == "weekly_all":
             weekly = lim
+        elif kind == "weekly_scoped":
+            scoped.append(lim)
 
     def pct(lim: dict | None) -> int:
         return int(lim.get("percent") or 0) if lim else 0
@@ -460,14 +463,26 @@ async def poll_api(token: str) -> dict | None:
         return reset_minutes(lim.get("resets_at")) if lim else -1
 
     severity = (session or {}).get("severity", "unknown")
+    local_now = datetime.now()
     payload = {
         "s": pct(session),
         "sr": rst(session),
         "w": pct(weekly),
         "wr": rst(weekly),
         "st": "allowed" if severity in ("normal", "warning") else "limited",
+        "tm": local_now.hour * 60 + local_now.minute,
         "ok": True,
     }
+    # Per-model weekly buckets — generic: whatever scoped limits the API
+    # reports get forwarded (Fable until retirement, Opus/Sonnet if/when
+    # they appear). Capped to keep the BLE payload small.
+    models = []
+    for lim in scoped[:4]:
+        scope = lim.get("scope") or {}
+        name = ((scope.get("model") or {}).get("display_name") or "Model")
+        models.append({"n": name[:10], "p": pct(lim), "r": rst(lim)})
+    if models:
+        payload["m"] = models
     return payload
 
 

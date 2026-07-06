@@ -109,7 +109,19 @@ static bool parse_json(const char* json, UsageData* out) {
     out->session_reset_mins = doc["sr"] | -1;
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
+    out->local_mins = doc["tm"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
+
+    out->model_count = 0;
+    JsonArray m = doc["m"];
+    for (JsonObject b : m) {
+        if (out->model_count >= MODEL_BUCKETS_MAX) break;
+        ModelBucket* mb = &out->models[out->model_count++];
+        strlcpy(mb->name, b["n"] | "Model", sizeof(mb->name));
+        mb->pct = b["p"] | 0.0f;
+        mb->reset_mins = b["r"] | -1;
+    }
+
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;
