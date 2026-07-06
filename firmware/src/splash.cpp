@@ -43,6 +43,19 @@ static int8_t  group_lists[GROUP_COUNT][GROUP_MAX];
 static uint8_t group_size[GROUP_COUNT] = {0};
 static uint8_t group_rotation[GROUP_COUNT] = {0};
 
+// Full-deck wildcard: every Nth rotation ignores the rate group and draws
+// from a shuffled deck of ALL animations, so everything gets airtime even
+// when the usage rate never leaves one group.
+#define WILDCARD_EVERY 3
+static uint8_t rotations_until_wildcard = WILDCARD_EVERY;
+static uint8_t deck[SPLASH_ANIM_COUNT > 0 ? SPLASH_ANIM_COUNT : 1];
+static uint8_t deck_pos = SPLASH_ANIM_COUNT;   // >= count forces a shuffle
+
+// Rare shiny: 1-in-SHINY_ODDS picks render with a gold palette.
+#define SHINY_ODDS 50
+static bool cur_shiny = false;
+static uint16_t shiny_palette[SPLASH_PALETTE_SIZE];
+
 static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
     // Group 0 — idle / sleepy
     { "expression sleep", "idle breathe", "idle blink", "expression wink" },
@@ -87,6 +100,49 @@ static void render_frame(const uint8_t *cells, const uint16_t *palette) {
         }
     }
     if (canvas) lv_obj_invalidate(canvas);
+}
+
+// Map an RGB565 color to a gold tone of matching brightness. Black stays
+// black so the background doesn't glow.
+static uint16_t goldify(uint16_t c) {
+    uint32_t r8 = ((c >> 11) & 0x1F) * 255 / 31;
+    uint32_t g8 = ((c >> 5) & 0x3F) * 255 / 63;
+    uint32_t b8 = (c & 0x1F) * 255 / 31;
+    uint32_t luma = (r8 * 30 + g8 * 59 + b8 * 11) / 100;
+    if (luma == 0) return 0x0000;
+    uint32_t R = luma;               // gold ~ (255, 196, 64) scaled by luma
+    uint32_t G = luma * 196 / 255;
+    uint32_t B = luma * 64 / 255;
+    return (uint16_t)(((R >> 3) << 11) | ((G >> 2) << 5) | (B >> 3));
+}
+
+static const uint16_t* active_palette(const splash_anim_def_t* a) {
+    return cur_shiny ? shiny_palette : a->palette;
+}
+
+// Switch to animation idx: reset frame clock, roll the shiny dice, render.
+static void set_current(uint16_t idx) {
+    cur_anim = idx;
+    cur_frame = 0;
+    frame_started_ms = millis();
+    last_pick_ms = frame_started_ms;
+    const splash_anim_def_t *a = &splash_anims[cur_anim];
+    cur_shiny = (random(SHINY_ODDS) == 0);
+    if (cur_shiny) {
+        for (int i = 0; i < SPLASH_PALETTE_SIZE; i++)
+            shiny_palette[i] = goldify(a->palette[i]);
+        Serial.printf("splash: shiny %s!\n", a->name);
+    }
+    render_frame(a->frames[0], active_palette(a));
+}
+
+static void shuffle_deck(void) {
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) deck[i] = (uint8_t)i;
+    for (int i = SPLASH_ANIM_COUNT - 1; i > 0; i--) {
+        int j = random(i + 1);
+        uint8_t t = deck[i]; deck[i] = deck[j]; deck[j] = t;
+    }
+    deck_pos = 0;
 }
 
 static void show_placeholder() {
@@ -180,23 +236,32 @@ void splash_tick(void) {
     if (millis() - frame_started_ms >= hold) {
         cur_frame = (cur_frame + 1) % a->frame_count;
         frame_started_ms = millis();
-        render_frame(a->frames[cur_frame], a->palette);
+        render_frame(a->frames[cur_frame], active_palette(a));
     }
 }
 
 void splash_next(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
-    cur_anim = (cur_anim + 1) % SPLASH_ANIM_COUNT;
-    cur_frame = 0;
-    frame_started_ms = millis();
-    last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    render_frame(a->frames[0], a->palette);
-    Serial.printf("splash: -> %s\n", a->name);
+    set_current((cur_anim + 1) % SPLASH_ANIM_COUNT);
+    Serial.printf("splash: -> %s\n", splash_anims[cur_anim].name);
 }
 
 void splash_pick_for_current_rate(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
+
+    // Wildcard turn: draw from the full shuffled deck instead of the group.
+    if (--rotations_until_wildcard == 0) {
+        rotations_until_wildcard = WILDCARD_EVERY;
+        if (deck_pos >= SPLASH_ANIM_COUNT) shuffle_deck();
+        uint8_t pick = deck[deck_pos++];
+        if (pick == cur_anim) {   // avoid a back-to-back repeat
+            if (deck_pos >= SPLASH_ANIM_COUNT) shuffle_deck();
+            pick = deck[deck_pos++];
+        }
+        set_current(pick);
+        return;
+    }
+
     int g = usage_rate_group();
     if (g < 0 || g >= GROUP_COUNT) g = 0;
     if (group_size[g] == 0) return;
@@ -206,12 +271,7 @@ void splash_pick_for_current_rate(void) {
     int8_t idx = group_lists[g][slot];
     if (idx < 0) return;
 
-    cur_anim = (uint16_t)idx;
-    cur_frame = 0;
-    frame_started_ms = millis();
-    last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    render_frame(a->frames[0], a->palette);
+    set_current((uint16_t)idx);
 }
 
 bool splash_is_active(void) { return active; }

@@ -439,18 +439,13 @@ async def poll_api(token: str) -> dict | None:
         mins = (ts - now) / 60.0
         return int(round(mins)) if mins > 0 else 0
 
-    session = weekly = fable = None
+    session = weekly = None
     for lim in body.get("limits") or []:
         kind = lim.get("kind")
         if kind == "session":
             session = lim
         elif kind == "weekly_all":
             weekly = lim
-        elif kind == "weekly_scoped":
-            scope = lim.get("scope") or {}
-            name = ((scope.get("model") or {}).get("display_name") or "").lower()
-            if name == "fable":
-                fable = lim
 
     def pct(lim: dict | None) -> int:
         return int(lim.get("percent") or 0) if lim else 0
@@ -467,9 +462,6 @@ async def poll_api(token: str) -> dict | None:
         "st": "allowed" if severity in ("normal", "warning") else "limited",
         "ok": True,
     }
-    if fable is not None:
-        payload["f"] = pct(fable)
-        payload["fr"] = rst(fable)
     return payload
 
 

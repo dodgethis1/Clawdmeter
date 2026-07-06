@@ -109,8 +109,6 @@ static bool parse_json(const char* json, UsageData* out) {
     out->session_reset_mins = doc["sr"] | -1;
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
-    out->fable_pct = doc["f"] | -1.0f;
-    out->fable_reset_mins = doc["fr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->ok = doc["ok"] | false;
     out->valid = true;
@@ -221,7 +219,6 @@ void setup() {
 
     ui_init();
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
-    ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
 
     Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
@@ -287,7 +284,10 @@ void loop() {
     // Rotation transition (blank + ramp) would fight the idle fade — skip
     // ticks while the panel is dark. A rotation that happens during sleep
     // is detected by the next tick after wake and ramped in then.
-    if (!idle_is_asleep()) display_hal_tick();
+    if (!idle_is_asleep()) {
+        ui_tick_screen_cycle();
+        display_hal_tick();
+    }
 
     // ---- Physical buttons ----
     //   PRIMARY / SECONDARY → wake the panel only. HID key sending (Space /
@@ -329,16 +329,6 @@ void loop() {
     if (bs != last_ble_state) {
         last_ble_state = bs;
         ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
-    }
-
-    static int  last_pct      = -2;
-    static bool last_charging = false;
-    int  pct      = power_hal_battery_pct();
-    bool charging = power_hal_is_charging();
-    if (pct != last_pct || charging != last_charging) {
-        last_pct = pct;
-        last_charging = charging;
-        ui_update_battery(pct, charging);
     }
 
     check_serial_cmd();

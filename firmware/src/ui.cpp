@@ -60,8 +60,8 @@ static void compute_layout(const BoardCaps& c) {
 
     if (c.height >= 460) {
         // Large layout — tuned for 480x480 (AMOLED-2.16).
-        // Three panels (Current / Weekly / Fable) instead of the original two,
-        // so the panel geometry is compacted to fit above the status line.
+        // Compact three-slot geometry: Current + Weekly panels, third slot
+        // reserved for the usage sparkline, all above the status line.
         L.content_y = 90;
         L.usage_panel_h = 104;
         L.usage_panel_gap = 10;
@@ -126,16 +126,9 @@ static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
-static lv_obj_t* bar_fable;
-static lv_obj_t* lbl_fable_pct;
-static lv_obj_t* lbl_fable_label;
-static lv_obj_t* lbl_fable_reset;
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
-// ---- Battery indicator (shared, on top) ----
-static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
-static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
@@ -274,14 +267,6 @@ static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
     return lbl;
 }
 
-static void init_battery_icons(void) {
-    init_icon_dsc_rgb565a8(&battery_dscs[0], ICON_BATTERY_W, ICON_BATTERY_H, icon_battery_data);
-    init_icon_dsc_rgb565a8(&battery_dscs[1], ICON_BATTERY_LOW_W, ICON_BATTERY_LOW_H, icon_battery_low_data);
-    init_icon_dsc_rgb565a8(&battery_dscs[2], ICON_BATTERY_MEDIUM_W, ICON_BATTERY_MEDIUM_H, icon_battery_medium_data);
-    init_icon_dsc_rgb565a8(&battery_dscs[3], ICON_BATTERY_FULL_W, ICON_BATTERY_FULL_H, icon_battery_full_data);
-    init_icon_dsc_rgb565a8(&battery_dscs[4], ICON_BATTERY_CHARGING_W, ICON_BATTERY_CHARGING_H, icon_battery_charging_data);
-}
-
 // ======== Usage Screen ========
 
 static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
@@ -374,10 +359,8 @@ static void init_usage_screen(lv_obj_t* scr) {
                      L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly",
                      &lbl_weekly_pct, &lbl_weekly_label,
                      &bar_weekly, &lbl_weekly_reset);
-    make_usage_panel(usage_group,
-                     L.content_y + 2 * (L.usage_panel_h + L.usage_panel_gap), "Fable",
-                     &lbl_fable_pct, &lbl_fable_label,
-                     &bar_fable, &lbl_fable_reset);
+    // Third panel slot (formerly Fable) is intentionally open — reserved
+    // for the session-usage sparkline.
 
     build_pair_group(usage_container);
 
@@ -399,7 +382,6 @@ void ui_init(void) {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
     init_icon_dsc_rgb565a8(&logo_dsc, LOGO_WIDTH, LOGO_HEIGHT, logo_data);
-    init_battery_icons();
 
     init_usage_screen(scr);
     splash_init(scr);
@@ -411,10 +393,6 @@ void ui_init(void) {
     logo_img = lv_image_create(scr);
     lv_image_set_src(logo_img, &logo_dsc);
     lv_obj_set_pos(logo_img, L.margin, L.title_y - 10);
-
-    battery_img = lv_image_create(scr);
-    lv_image_set_src(battery_img, &battery_dscs[0]);
-    lv_obj_set_pos(battery_img, L.scr_w - 48 - L.margin, L.title_y);
 }
 
 void ui_update(const UsageData* data) {
@@ -437,20 +415,6 @@ void ui_update(const UsageData* data) {
 
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
-
-    if (data->fable_pct >= 0.0f) {
-        int f_pct = (int)(data->fable_pct + 0.5f);
-        lv_label_set_text_fmt(lbl_fable_pct, "%d%%", f_pct);
-        lv_bar_set_value(bar_fable, f_pct, LV_ANIM_ON);
-        lv_obj_set_style_bg_color(bar_fable, pct_color(data->fable_pct), LV_PART_INDICATOR);
-        format_reset_time(data->fable_reset_mins, buf, sizeof(buf));
-        lv_label_set_text(lbl_fable_reset, buf);
-    } else {
-        // Daemon didn't report a Fable bucket — keep the panel neutral.
-        lv_label_set_text(lbl_fable_pct, "---%");
-        lv_label_set_text(lbl_fable_reset, "---");
-        lv_bar_set_value(bar_fable, 0, LV_ANIM_OFF);
-    }
 }
 
 void ui_tick_anim(void) {
@@ -487,16 +451,23 @@ void ui_tick_anim(void) {
 }
 
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
-static void apply_battery_visibility(void) {
-    if (!battery_img) return;
-    if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-    else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-}
+
+// ---- Auto-cycle: alternate Usage <-> Activity (splash). A tap switches
+// immediately and pauses the cycle so it doesn't fight the user.
+#define SCREEN_CYCLE_INTERVAL_MS 12000
+#define SCREEN_CYCLE_TAP_PAUSE_MS 30000
+static uint32_t next_auto_cycle_ms = SCREEN_CYCLE_INTERVAL_MS;
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
     else                                  ui_show_screen(SCREEN_SPLASH);
+    next_auto_cycle_ms = lv_tick_get() + SCREEN_CYCLE_TAP_PAUSE_MS;
+}
+
+void ui_tick_screen_cycle(void) {
+    if ((int32_t)(lv_tick_get() - next_auto_cycle_ms) < 0) return;
+    ui_toggle_splash();
 }
 
 void ui_show_screen(screen_t screen) {
@@ -516,7 +487,7 @@ void ui_show_screen(screen_t screen) {
 
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
-    apply_battery_visibility();
+    next_auto_cycle_ms = lv_tick_get() + SCREEN_CYCLE_INTERVAL_MS;
 }
 
 void ui_toggle_splash(void) {
@@ -548,21 +519,4 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
 }
 
-void ui_update_battery(int percent, bool charging) {
-    int idx;
-    if (charging) {
-        idx = 4;
-    } else if (percent < 0) {
-        idx = 0;
-    } else if (percent <= 10) {
-        idx = 0;
-    } else if (percent <= 35) {
-        idx = 1;
-    } else if (percent <= 75) {
-        idx = 2;
-    } else {
-        idx = 3;
-    }
-    lv_image_set_src(battery_img, &battery_dscs[idx]);
-    apply_battery_visibility();
-}
+
