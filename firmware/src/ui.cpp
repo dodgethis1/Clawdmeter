@@ -39,6 +39,7 @@ struct Layout {
     const lv_font_t* usage_pct_font;
     const lv_font_t* usage_pill_font;
     const lv_font_t* usage_reset_font;
+    const lv_font_t* usage_bar_label_font;   // reset time printed on the bar
 
     // Bluetooth screen
     int16_t bt_info_panel_h;
@@ -69,13 +70,14 @@ static void compute_layout(const BoardCaps& c) {
         L.content_y = 90;
         L.usage_panel_h = 150;
         L.usage_panel_gap = 10;
-        L.usage_bar_y = 92;
-        L.usage_bar_h = 30;
+        L.usage_bar_y = 90;
+        L.usage_bar_h = 34;
         L.usage_arc_size = 118;
         L.usage_arc_width = 16;
         L.usage_pct_font = &font_styrene_48;
         L.usage_pill_font = &font_styrene_24;
         L.usage_reset_font = &font_styrene_20;
+        L.usage_bar_label_font = &font_styrene_28;
         L.bt_info_panel_h = 160;
         L.bt_reset_zone_h = 110;
         L.bt_title_font    = &font_tiempos_56;
@@ -89,12 +91,13 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_h = 118;
         L.usage_panel_gap = 8;
         L.usage_bar_y = 58;
-        L.usage_bar_h = 20;
+        L.usage_bar_h = 24;
         L.usage_arc_size = 84;
         L.usage_arc_width = 12;
         L.usage_pct_font = &font_styrene_28;
         L.usage_pill_font = &font_styrene_16;
         L.usage_reset_font = &font_styrene_16;
+        L.usage_bar_label_font = &font_styrene_16;
         L.bt_info_panel_h = 140;
         L.bt_reset_zone_h = 90;
         L.bt_title_font    = &font_tiempos_34;
@@ -354,12 +357,6 @@ static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
     *out_pill = make_pill(panel, pill_text);
     lv_obj_align(*out_pill, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    *out_reset = lv_label_create(panel);
-    lv_label_set_text(*out_reset, "---");
-    lv_obj_set_style_text_font(*out_reset, L.usage_reset_font, 0);
-    lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
-    lv_obj_align(*out_reset, LV_ALIGN_TOP_RIGHT, -(L.usage_arc_size + 14), 6);
-
     *out_pct = lv_label_create(panel);
     lv_label_set_text(*out_pct, "---%");
     lv_obj_set_style_text_font(*out_pct, L.usage_pct_font, 0);
@@ -368,6 +365,13 @@ static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
 
     int bar_w = L.content_w - 32 - L.usage_arc_size - 14;
     *out_bar = make_bar(panel, 0, L.usage_bar_y, bar_w, L.usage_bar_h);
+
+    // Reset time rides on the bar itself — big print, zero extra space.
+    *out_reset = lv_label_create(*out_bar);
+    lv_label_set_text(*out_reset, "---");
+    lv_obj_set_style_text_font(*out_reset, L.usage_bar_label_font, 0);
+    lv_obj_set_style_text_color(*out_reset, COL_TEXT, 0);
+    lv_obj_center(*out_reset);
 
     *out_arc = make_donut(panel, window_text);
 }
