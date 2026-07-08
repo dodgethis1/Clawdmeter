@@ -161,12 +161,20 @@ static TrendPage pg_history;
 static TrendPage pg_weekly;
 
 // ---- Models screen widgets ----
+// Adaptive: 1-2 buckets render as full-size usage panels (donut and all),
+// 3-4 fall back to compact rows.
 static lv_obj_t* models_container;
 static lv_obj_t* mdl_panel[MODEL_BUCKETS_MAX];
 static lv_obj_t* mdl_pill[MODEL_BUCKETS_MAX];
 static lv_obj_t* mdl_pct[MODEL_BUCKETS_MAX];
 static lv_obj_t* mdl_bar[MODEL_BUCKETS_MAX];
 static lv_obj_t* mdl_reset[MODEL_BUCKETS_MAX];
+static lv_obj_t* mdl_big_panel[2];
+static lv_obj_t* mdl_big_pill[2];
+static lv_obj_t* mdl_big_pct[2];
+static lv_obj_t* mdl_big_bar[2];
+static lv_obj_t* mdl_big_reset[2];
+static lv_obj_t* mdl_big_arc[2];
 static lv_obj_t* lbl_anim_models;
 static int s_model_count = 0;
 
@@ -610,6 +618,13 @@ static void refresh_trend_chart(TrendPage* p) {
 
 // ======== Models Screen ========
 
+// Defined in the Usage section below; reused for prominent model panels.
+static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
+                             const char* window_text,
+                             lv_obj_t** out_pct, lv_obj_t** out_pill,
+                             lv_obj_t** out_bar, lv_obj_t** out_reset,
+                             lv_obj_t** out_arc);
+
 static void init_models_screen(lv_obj_t* scr) {
     models_container = lv_obj_create(scr);
     lv_obj_set_size(models_container, L.scr_w, L.scr_h);
@@ -655,6 +670,17 @@ static void init_models_screen(lv_obj_t* scr) {
         lv_obj_add_flag(mdl_panel[i], LV_OBJ_FLAG_HIDDEN);
     }
 
+    // Full-size panels for the 1-2 bucket case — same look as the Usage page.
+    for (int i = 0; i < 2; i++) {
+        make_usage_panel(models_container,
+                         L.content_y + i * (L.usage_panel_h + L.usage_panel_gap),
+                         "Model", "7d",
+                         &mdl_big_pct[i], &mdl_big_pill[i],
+                         &mdl_big_bar[i], &mdl_big_reset[i], &mdl_big_arc[i]);
+        mdl_big_panel[i] = lv_obj_get_parent(mdl_big_pct[i]);
+        lv_obj_add_flag(mdl_big_panel[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
     lbl_anim_models = lv_label_create(models_container);
     lv_label_set_text(lbl_anim_models, "");
     lv_obj_set_style_text_font(lbl_anim_models, &font_mono_32, 0);
@@ -667,8 +693,29 @@ static void init_models_screen(lv_obj_t* scr) {
 static void refresh_models_widgets(const UsageData* data) {
     s_model_count = data->model_count;
     char buf[48];
+    bool big_mode = (data->model_count > 0 && data->model_count <= 2);
+
+    for (int i = 0; i < 2; i++) {
+        if (big_mode && i < data->model_count) {
+            const ModelBucket* mb = &data->models[i];
+            lv_label_set_text(mdl_big_pill[i], mb->name);
+            int p = (int)(mb->pct + 0.5f);
+            lv_label_set_text_fmt(mdl_big_pct[i], "%d%%", p);
+            lv_obj_set_style_text_color(mdl_big_pct[i], pct_color(mb->pct), 0);
+            lv_bar_set_value(mdl_big_bar[i], p, LV_ANIM_ON);
+            lv_obj_set_style_bg_color(mdl_big_bar[i], pct_color(mb->pct), LV_PART_INDICATOR);
+            lv_arc_set_value(mdl_big_arc[i], p);
+            lv_obj_set_style_arc_color(mdl_big_arc[i], pct_color(mb->pct), LV_PART_INDICATOR);
+            format_reset_time(mb->reset_mins, buf, sizeof(buf));
+            lv_label_set_text(mdl_big_reset[i], buf);
+            lv_obj_clear_flag(mdl_big_panel[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(mdl_big_panel[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     for (int i = 0; i < MODEL_BUCKETS_MAX; i++) {
-        if (i < data->model_count) {
+        if (!big_mode && i < data->model_count) {
             const ModelBucket* mb = &data->models[i];
             lv_label_set_text(mdl_pill[i], mb->name);
             int p = (int)(mb->pct + 0.5f);
