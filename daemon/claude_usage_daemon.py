@@ -605,26 +605,14 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                # Mark the attempt time up front so a failed poll waits a full
-                # POLL_INTERVAL before retrying instead of hammering the API
-                # every TICK seconds (which keeps a 429 rate limit pinned).
                 last_poll = time.time()
-                token = await ensure_token()
-                if not token:
-                    log("No token; skipping poll")
-                else:
-                    payload = await poll_api(token)
-                    if payload is AUTH_ERROR:
-                        # Stored token rejected — force a refresh and retry once.
-                        token = await ensure_token(force=True)
-                        payload = await poll_api(token) if token else None
-                        if payload is AUTH_ERROR:
-                            payload = None
-                    if payload is not None:
-                        _store_usage(payload)
-                        if await session.write_payload(payload):
-                            used_successfully = True
-                            _last_alive[0] = time.time()
+                # Polling now lives in poll_loop() — the BLE session just
+                # forwards the latest stored payload to the legacy device.
+                with _last_usage_lock:
+                    payload = _last_usage["payload"]
+                if payload is not None:
+                    if await session.write_payload(payload):
+                        used_successfully = True
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
@@ -638,6 +626,30 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
 
     log("Device disconnected" if not stop_event.is_set() else "Stopping")
     return used_successfully
+
+
+async def poll_loop(stop_event: asyncio.Event) -> None:
+    """Poll the usage API on an independent clock. The HTTP endpoint (and
+    any BLE client) consume the stored result — a BLE device is optional."""
+    while not stop_event.is_set():
+        token = await ensure_token()
+        if token:
+            payload = await poll_api(token)
+            if payload is AUTH_ERROR:
+                # Stored token rejected — force a refresh and retry once.
+                token = await ensure_token(force=True)
+                payload = await poll_api(token) if token else None
+                if payload is AUTH_ERROR:
+                    payload = None
+            if payload is not None:
+                _store_usage(payload)
+                _last_alive[0] = time.time()   # watchdog keys on poll success
+        else:
+            log("No token; skipping poll")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def main() -> None:
@@ -658,20 +670,19 @@ async def main() -> None:
     log(f"Poll interval: {POLL_INTERVAL}s")
     start_http_server()
 
-    # Watchdog: if nothing has been successfully sent to the device in
-    # WATCHDOG_SECS, assume we're wedged (hung connect, dead event loop,
-    # zombie BLE stack) and exit hard. launchd's KeepAlive relaunches us
-    # with a clean slate. os._exit because a hung CoreBluetooth await
-    # ignores task cancellation — a polite SystemExit never lands.
+    # Watchdog: if no successful API poll in WATCHDOG_SECS, assume we're
+    # wedged and exit hard. launchd's KeepAlive relaunches us with a clean
+    # slate. (Re-keyed from BLE sends to poll success — BLE is optional now.)
     async def _watchdog() -> None:
         while not stop_event.is_set():
             await asyncio.sleep(30)
             stale = time.time() - _last_alive[0]
             if stale > WATCHDOG_SECS:
-                log(f"Watchdog: no successful send in {int(stale)}s - exiting for relaunch")
+                log(f"Watchdog: no successful poll in {int(stale)}s - exiting for relaunch")
                 os._exit(1)
 
     asyncio.get_running_loop().create_task(_watchdog())
+    asyncio.get_running_loop().create_task(poll_loop(stop_event))
 
     backoff = 1
     skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle
