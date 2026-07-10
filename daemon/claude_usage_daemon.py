@@ -8,12 +8,14 @@ bleak (CoreBluetooth backend on macOS).
 
 import asyncio
 import getpass
+import http.server
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +71,58 @@ API_BODY = {
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# HTTP usage endpoint (for the Puckmeter hub).
+# Serves the latest polled usage payload on GET /usage. Set
+# CLAWDMETER_HTTP_PORT=0 to disable.
+# ---------------------------------------------------------------------------
+HTTP_PORT = int(os.environ.get("CLAWDMETER_HTTP_PORT", "8788"))
+
+_last_usage_lock = threading.Lock()
+_last_usage: dict = {"ts": 0.0, "payload": None}
+
+
+def _store_usage(payload: dict) -> None:
+    with _last_usage_lock:
+        _last_usage["ts"] = time.time()
+        _last_usage["payload"] = payload
+
+
+class _UsageHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/usage":
+            self.send_response(404)
+            self.end_headers()
+            return
+        with _last_usage_lock:
+            ts = _last_usage["ts"]
+            body = json.dumps({
+                "ts": ts,
+                "age_s": round(time.time() - ts, 1) if ts else None,
+                "usage": _last_usage["payload"],
+            }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass  # keep daemon log clean
+
+
+def start_http_server() -> None:
+    if HTTP_PORT <= 0:
+        return
+    try:
+        srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _UsageHandler)
+    except OSError as e:
+        log(f"HTTP usage endpoint disabled: {e}")
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True, name="usage-http").start()
+    log(f"HTTP usage endpoint on :{HTTP_PORT}/usage")
 
 
 def _extract_access_token(blob: str) -> str | None:
@@ -567,6 +621,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                         if payload is AUTH_ERROR:
                             payload = None
                     if payload is not None:
+                        _store_usage(payload)
                         if await session.write_payload(payload):
                             used_successfully = True
                             _last_alive[0] = time.time()
@@ -601,6 +656,7 @@ async def main() -> None:
 
     log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
+    start_http_server()
 
     # Watchdog: if nothing has been successfully sent to the device in
     # WATCHDOG_SECS, assume we're wedged (hung connect, dead event loop,
